@@ -6,7 +6,10 @@ import numpy as np
 from einops import rearrange
 from typing import Optional, Any
 
-from lightning.pytorch.utilities import rank_zero_info
+try:
+    from lightning.pytorch.utilities import rank_zero_info
+except:
+    from pytorch_lightning.utilities import rank_zero_info
 
 from ldm.modules.attention import MemoryEfficientCrossAttention
 

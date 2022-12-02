@@ -3,7 +3,10 @@ import numpy as np
 import time
 import torch
 import torchvision
-import lightning.pytorch as pl
+try:
+    import lightning.pytorch as pl
+except:
+    import pytorch_lightning as pl
 
 from packaging import version
 from omegaconf import OmegaConf
@@ -12,11 +15,19 @@ from functools import partial
 from PIL import Image
 
 from prefetch_generator import BackgroundGenerator
-from lightning.pytorch import seed_everything
-from lightning.pytorch.trainer import Trainer
-from lightning.pytorch.callbacks import ModelCheckpoint, Callback, LearningRateMonitor
-from lightning.pytorch.utilities import rank_zero_only, rank_zero_info
 
+try:
+    from lightning.pytorch import seed_everything
+    from lightning.pytorch.trainer import Trainer
+    from lightning.pytorch.callbacks import ModelCheckpoint, Callback, LearningRateMonitor
+    from lightning.pytorch.utilities import rank_zero_only, rank_zero_info
+    LIGHTNING_PACK_NAME = "lightning.pytorch."
+except:
+    from pytorch_lightning import seed_everything
+    from pytorch_lightning.trainer import Trainer
+    from pytorch_lightning.callbacks import ModelCheckpoint, Callback, LearningRateMonitor
+    from pytorch_lightning.utilities import rank_zero_only, rank_zero_info
+    LIGHTNING_PACK_NAME = "pytorch_lightning."
 
 from ldm.data.base import Txt2ImgIterableBaseDataset
 from ldm.util import instantiate_from_config
@@ -584,7 +595,7 @@ if __name__ == "__main__":
         # default logger configs
         default_logger_cfgs = {
             "wandb": {
-                "target": "lightning.pytorch.loggers.WandbLogger",
+                "target": LIGHTNING_PACK_NAME + "loggers.WandbLogger",
                 "params": {
                     "name": nowname,
                     "save_dir": logdir,
@@ -593,7 +604,7 @@ if __name__ == "__main__":
                 }
             },
             "tensorboard":{
-                "target": "lightning.pytorch.loggers.TensorBoardLogger",
+                "target": LIGHTNING_PACK_NAME + "loggers.TensorBoardLogger",
                 "params":{
                     "save_dir": logdir,
                     "name": "diff_tb",
@@ -614,9 +625,10 @@ if __name__ == "__main__":
         if "strategy" in trainer_config:
             strategy_cfg = trainer_config["strategy"]
             print("Using strategy: {}".format(strategy_cfg["target"]))
+            strategy_cfg["target"] = LIGHTNING_PACK_NAME + strategy_cfg["target"]
         else:
             strategy_cfg = {
-                "target": "lightning.pytorch.strategies.DDPStrategy",
+                "target": LIGHTNING_PACK_NAME + "strategies.DDPStrategy",
                 "params": {
                     "find_unused_parameters": False
                 }
@@ -628,7 +640,7 @@ if __name__ == "__main__":
         # modelcheckpoint - use TrainResult/EvalResult(checkpoint_on=metric) to
         # specify which metric is used to determine best models
         default_modelckpt_cfg = {
-            "target": "lightning.pytorch.callbacks.ModelCheckpoint",
+            "target": LIGHTNING_PACK_NAME + "callbacks.ModelCheckpoint",
             "params": {
                 "dirpath": ckptdir,
                 "filename": "{epoch:06}",
@@ -696,7 +708,7 @@ if __name__ == "__main__":
                 'Caution: Saving checkpoints every n train steps without deleting. This might require some free space.')
             default_metrics_over_trainsteps_ckpt_dict = {
                 'metrics_over_trainsteps_checkpoint':
-                    {"target": 'lightning.pytorch.callbacks.ModelCheckpoint',
+                    {"target": LIGHTNING_PACK_NAME + 'callbacks.ModelCheckpoint',
                      'params': {
                          "dirpath": os.path.join(ckptdir, 'trainstep_checkpoints'),
                          "filename": "{epoch:06}-{step:09}",

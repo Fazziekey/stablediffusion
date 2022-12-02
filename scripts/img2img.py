@@ -12,7 +12,10 @@ from einops import rearrange, repeat
 from torchvision.utils import make_grid
 from torch import autocast
 from contextlib import nullcontext
-from lightning.pytorch import seed_everything
+try:
+    from lightning.pytorch import seed_everything
+except:
+    from pytorch_lightning import seed_everything
 from imwatermark import WatermarkEncoder
 
 
