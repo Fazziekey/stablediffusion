@@ -29,10 +29,28 @@ from ldm.util import log_txt_as_img, exists, default, ismap, isimage, mean_flat,
 from ldm.modules.ema import LitEma
 from ldm.modules.distributions.distributions import normal_kl, DiagonalGaussianDistribution
 from ldm.models.autoencoder import IdentityFirstStage, AutoencoderKL
+
+
 from ldm.modules.diffusionmodules.util import make_beta_schedule, extract_into_tensor, noise_like
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.modules.diffusionmodules.openaimodel import *
 
+from ldm.modules.diffusionmodules.util import make_beta_schedule, extract_into_tensor, noise_like
+from ldm.models.diffusion.ddim import DDIMSampler
+from ldm.modules.diffusionmodules.openaimodel import AttentionPool2d
+from ldm.modules.encoders.modules import *
+
+from ldm.modules.ema import LitEma
+from ldm.modules.distributions.distributions import normal_kl, DiagonalGaussianDistribution
+from ldm.models.autoencoder import *
+from ldm.models.diffusion.ddim import *
+from ldm.modules.diffusionmodules.openaimodel import *
+from ldm.modules.diffusionmodules.model import *
+
+
+from ldm.modules.diffusionmodules.model import Model, Encoder, Decoder
+
+from ldm.util import instantiate_from_config
 
 
 __conditioning_keys__ = {'concat': 'c_concat',
@@ -100,8 +118,8 @@ class DDPM(pl.LightningModule):
 
         self.unet_config = unet_config
         self.conditioning_key = conditioning_key
-        self.model = DiffusionWrapper(unet_config, conditioning_key)
-        count_params(self.model, verbose=True)
+        # self.model = DiffusionWrapper(unet_config, conditioning_key)
+        # count_params(self.model, verbose=True)
         self.use_ema = use_ema
         if self.use_ema:
             self.model_ema = LitEma(self.model)
@@ -585,27 +603,28 @@ class LatentDiffusion(DDPM):
             self.register_buffer('scale_factor', torch.tensor(scale_factor))
         self.first_stage_config = first_stage_config
         self.cond_stage_config = cond_stage_config
-        self.instantiate_first_stage(first_stage_config)
-        self.instantiate_cond_stage(cond_stage_config)
+        # self.instantiate_first_stage(first_stage_config)
+        # self.instantiate_cond_stage(cond_stage_config)
         self.cond_stage_forward = cond_stage_forward
         self.clip_denoised = False
         self.bbox_tokenizer = None
 
-        self.restarted_from_ckpt = False
-        if self.ckpt_path is not None:
-            self.init_from_ckpt(self.ckpt_path, self.ignore_keys)
-            self.restarted_from_ckpt = True
-            if self.reset_ema:
-                assert self.use_ema
-                print(
-                    f"Resetting ema to pure model weights. This is useful when restoring from an ema-only checkpoint.")
-                self.model_ema = LitEma(self.model)
-        if self.reset_num_ema_updates:
-            print(" +++++++++++ WARNING: RESETTING NUM_EMA UPDATES TO ZERO +++++++++++ ")
-            assert self.use_ema
-            self.model_ema.reset_num_updates()
+        # self.restarted_from_ckpt = False
+        # if self.ckpt_path is not None:
+        #     self.init_from_ckpt(self.ckpt_path, self.ignore_keys)
+        #     self.restarted_from_ckpt = True
+        #     if self.reset_ema:
+        #         assert self.use_ema
+        #         print(
+        #             f"Resetting ema to pure model weights. This is useful when restoring from an ema-only checkpoint.")
+        #         self.model_ema = LitEma(self.model)
+        # if self.reset_num_ema_updates:
+        #     print(" +++++++++++ WARNING: RESETTING NUM_EMA UPDATES TO ZERO +++++++++++ ")
+        #     assert self.use_ema
+        #     self.model_ema.reset_num_updates()
 
     def configure_sharded_model(self) -> None:
+        print("Configure sharded model for LatentDiffusion")
         rank_zero_info("Configure sharded model for LatentDiffusion")
         self.model = DiffusionWrapper(self.unet_config, self.conditioning_key)
         if self.use_ema:
