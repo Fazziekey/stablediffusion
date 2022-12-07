@@ -5,7 +5,10 @@ import streamlit as st
 from PIL import Image
 from omegaconf import OmegaConf
 from einops import repeat, rearrange
-from pytorch_lightning import seed_everything
+try:
+    from lightning.pytorch import seed_everything
+except:
+    from pytorch_lightning import seed_everything
 from imwatermark import WatermarkEncoder
 
 from scripts.txt2img import put_watermark

@@ -9,7 +9,12 @@ https://github.com/CompVis/taming-transformers
 import torch
 import torch.nn as nn
 import numpy as np
-import pytorch_lightning as pl
+try:
+    import lightning.pytorch as pl
+    from lightning.pytorch.utilities import rank_zero_only, rank_zero_info
+except:
+    import pytorch_lightning as pl
+    from pytorch_lightning.utilities import rank_zero_only, rank_zero_info
 from torch.optim.lr_scheduler import LambdaLR
 from einops import rearrange, repeat
 from contextlib import contextmanager, nullcontext
@@ -17,15 +22,35 @@ from functools import partial
 import itertools
 from tqdm import tqdm
 from torchvision.utils import make_grid
-from pytorch_lightning.utilities.distributed import rank_zero_only
+
 from omegaconf import ListConfig
 
 from ldm.util import log_txt_as_img, exists, default, ismap, isimage, mean_flat, count_params, instantiate_from_config
 from ldm.modules.ema import LitEma
 from ldm.modules.distributions.distributions import normal_kl, DiagonalGaussianDistribution
 from ldm.models.autoencoder import IdentityFirstStage, AutoencoderKL
+
+
 from ldm.modules.diffusionmodules.util import make_beta_schedule, extract_into_tensor, noise_like
 from ldm.models.diffusion.ddim import DDIMSampler
+from ldm.modules.diffusionmodules.openaimodel import *
+
+from ldm.modules.diffusionmodules.util import make_beta_schedule, extract_into_tensor, noise_like
+from ldm.models.diffusion.ddim import DDIMSampler
+from ldm.modules.diffusionmodules.openaimodel import AttentionPool2d
+from ldm.modules.encoders.modules import *
+
+from ldm.modules.ema import LitEma
+from ldm.modules.distributions.distributions import normal_kl, DiagonalGaussianDistribution
+from ldm.models.autoencoder import *
+from ldm.models.diffusion.ddim import *
+from ldm.modules.diffusionmodules.openaimodel import *
+from ldm.modules.diffusionmodules.model import *
+
+
+from ldm.modules.diffusionmodules.model import Model, Encoder, Decoder
+
+from ldm.util import instantiate_from_config
 
 
 __conditioning_keys__ = {'concat': 'c_concat',
@@ -73,6 +98,7 @@ class DDPM(pl.LightningModule):
                  use_positional_encodings=False,
                  learn_logvar=False,
                  logvar_init=0.,
+                 use_fp16 = True,
                  make_it_fit=False,
                  ucg_training=None,
                  reset_ema=False,
@@ -81,7 +107,7 @@ class DDPM(pl.LightningModule):
         super().__init__()
         assert parameterization in ["eps", "x0", "v"], 'currently only supporting "eps" and "x0" and "v"'
         self.parameterization = parameterization
-        print(f"{self.__class__.__name__}: Running in {self.parameterization}-prediction mode")
+        rank_zero_info(f"{self.__class__.__name__}: Running in {self.parameterization}-prediction mode")
         self.cond_stage_model = None
         self.clip_denoised = clip_denoised
         self.log_every_t = log_every_t
@@ -89,6 +115,9 @@ class DDPM(pl.LightningModule):
         self.image_size = image_size  # try conv?
         self.channels = channels
         self.use_positional_encodings = use_positional_encodings
+
+        self.unet_config = unet_config
+        self.conditioning_key = conditioning_key
         self.model = DiffusionWrapper(unet_config, conditioning_key)
         count_params(self.model, verbose=True)
         self.use_ema = use_ema
@@ -107,6 +136,12 @@ class DDPM(pl.LightningModule):
         if monitor is not None:
             self.monitor = monitor
         self.make_it_fit = make_it_fit
+        self.ckpt_path = ckpt_path
+        self.ignore_keys = ignore_keys
+        self.load_only_unet = load_only_unet
+        self.reset_ema = reset_ema
+        self.reset_num_ema_updates = reset_num_ema_updates
+
         if reset_ema: assert exists(ckpt_path)
         if ckpt_path is not None:
             self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys, only_model=load_only_unet)
@@ -119,16 +154,24 @@ class DDPM(pl.LightningModule):
             assert self.use_ema
             self.model_ema.reset_num_updates()
 
+        self.timesteps = timesteps
+        self.beta_schedule = beta_schedule
+        self.given_betas = given_betas
+        self.linear_start = linear_start
+        self.linear_end = linear_end
+        self.cosine_s = cosine_s
+        
         self.register_schedule(given_betas=given_betas, beta_schedule=beta_schedule, timesteps=timesteps,
                                linear_start=linear_start, linear_end=linear_end, cosine_s=cosine_s)
 
         self.loss_type = loss_type
 
+        self.logvar_init = logvar_init
         self.learn_logvar = learn_logvar
         self.logvar = torch.full(fill_value=logvar_init, size=(self.num_timesteps,))
         if self.learn_logvar:
             self.logvar = nn.Parameter(self.logvar, requires_grad=True)
-
+        self.use_fp16 = use_fp16
         self.ucg_training = ucg_training or dict()
         if self.ucg_training:
             self.ucg_prng = np.random.RandomState()
@@ -419,7 +462,10 @@ class DDPM(pl.LightningModule):
         if len(x.shape) == 3:
             x = x[..., None]
         x = rearrange(x, 'b h w c -> b c h w')
-        x = x.to(memory_format=torch.contiguous_format).float()
+        if self.use_fp16:
+            x = x.to(memory_format=torch.contiguous_format).half()
+        else:
+            x = x.to(memory_format=torch.contiguous_format).float()
         return x
 
     def shared_step(self, batch):
@@ -532,6 +578,7 @@ class LatentDiffusion(DDPM):
                  conditioning_key=None,
                  scale_factor=1.0,
                  scale_by_std=False,
+                 use_fp16=True,
                  force_null_conditioning=False,
                  *args, **kwargs):
         self.force_null_conditioning = force_null_conditioning
@@ -543,10 +590,7 @@ class LatentDiffusion(DDPM):
             conditioning_key = 'concat' if concat_mode else 'crossattn'
         if cond_stage_config == '__is_unconditional__' and not self.force_null_conditioning:
             conditioning_key = None
-        ckpt_path = kwargs.pop("ckpt_path", None)
-        reset_ema = kwargs.pop("reset_ema", False)
-        reset_num_ema_updates = kwargs.pop("reset_num_ema_updates", False)
-        ignore_keys = kwargs.pop("ignore_keys", [])
+        
         super().__init__(conditioning_key=conditioning_key, *args, **kwargs)
         self.concat_mode = concat_mode
         self.cond_stage_trainable = cond_stage_trainable
@@ -555,10 +599,13 @@ class LatentDiffusion(DDPM):
             self.num_downs = len(first_stage_config.params.ddconfig.ch_mult) - 1
         except:
             self.num_downs = 0
+            
         if not scale_by_std:
             self.scale_factor = scale_factor
         else:
             self.register_buffer('scale_factor', torch.tensor(scale_factor))
+        self.first_stage_config = first_stage_config
+        self.cond_stage_config = cond_stage_config
         self.instantiate_first_stage(first_stage_config)
         self.instantiate_cond_stage(cond_stage_config)
         self.cond_stage_forward = cond_stage_forward
@@ -566,15 +613,56 @@ class LatentDiffusion(DDPM):
         self.bbox_tokenizer = None
 
         self.restarted_from_ckpt = False
-        if ckpt_path is not None:
-            self.init_from_ckpt(ckpt_path, ignore_keys)
+        if self.ckpt_path is not None:
+            self.init_from_ckpt(self.ckpt_path, self.ignore_keys)
             self.restarted_from_ckpt = True
-            if reset_ema:
+            if self.reset_ema:
                 assert self.use_ema
                 print(
                     f"Resetting ema to pure model weights. This is useful when restoring from an ema-only checkpoint.")
                 self.model_ema = LitEma(self.model)
-        if reset_num_ema_updates:
+        if self.reset_num_ema_updates:
+            print(" +++++++++++ WARNING: RESETTING NUM_EMA UPDATES TO ZERO +++++++++++ ")
+            assert self.use_ema
+            self.model_ema.reset_num_updates()
+
+    def configure_sharded_model(self) -> None:
+        rank_zero_info("Configure sharded model for LatentDiffusion")
+        self.model = DiffusionWrapper(self.unet_config, self.conditioning_key)
+        if self.use_ema:
+            self.model_ema = LitEma(self.model)
+
+        if self.ckpt_path is not None:
+            self.init_from_ckpt(self.ckpt_path, ignore_keys=self.ignore_keys, only_model=self.load_only_unet)
+            if self.reset_ema:
+                assert self.use_ema
+                print(f"Resetting ema to pure model weights. This is useful when restoring from an ema-only checkpoint.")
+                self.model_ema = LitEma(self.model)
+        if self.reset_num_ema_updates:
+            print(" +++++++++++ WARNING: RESETTING NUM_EMA UPDATES TO ZERO +++++++++++ ")
+            assert self.use_ema
+            self.model_ema.reset_num_updates()
+
+        self.register_schedule(given_betas=self.given_betas, beta_schedule=self.beta_schedule, timesteps=self.timesteps,
+                               linear_start=self.linear_start, linear_end=self.linear_end, cosine_s=self.cosine_s)
+
+        self.logvar = torch.full(fill_value=self.logvar_init, size=(self.num_timesteps,))
+        if self.learn_logvar:
+            self.logvar = nn.Parameter(self.logvar, requires_grad=True)
+        if self.ucg_training:
+            self.ucg_prng = np.random.RandomState()
+
+        self.instantiate_first_stage(self.first_stage_config)
+        self.instantiate_cond_stage(self.cond_stage_config)
+        if self.ckpt_path is not None:
+            self.init_from_ckpt(self.ckpt_path, self.ignore_keys)
+            self.restarted_from_ckpt = True
+            if self.reset_ema:
+                assert self.use_ema
+                print(
+                    f"Resetting ema to pure model weights. This is useful when restoring from an ema-only checkpoint.")
+                self.model_ema = LitEma(self.model)
+        if self.reset_num_ema_updates:
             print(" +++++++++++ WARNING: RESETTING NUM_EMA UPDATES TO ZERO +++++++++++ ")
             assert self.use_ema
             self.model_ema.reset_num_updates()
@@ -586,7 +674,7 @@ class LatentDiffusion(DDPM):
 
     @rank_zero_only
     @torch.no_grad()
-    def on_train_batch_start(self, batch, batch_idx, dataloader_idx):
+    def on_train_batch_start(self, batch, batch_idx):
         # only for very first batch
         if self.scale_by_std and self.current_epoch == 0 and self.global_step == 0 and batch_idx == 0 and not self.restarted_from_ckpt:
             assert self.scale_factor == 1., 'rather not use custom rescaling and std-rescaling simultaneously'
@@ -657,7 +745,7 @@ class LatentDiffusion(DDPM):
             z = encoder_posterior
         else:
             raise NotImplementedError(f"encoder_posterior of type '{type(encoder_posterior)}' not yet implemented")
-        return self.scale_factor * z
+        return self.scale_factor * z.half() if self.use_fp16 else self.scale_factor * z
 
     def get_learned_conditioning(self, c):
         if self.cond_stage_forward is None:
@@ -812,6 +900,7 @@ class LatentDiffusion(DDPM):
             out.extend([x])
         if return_original_cond:
             out.append(xc)
+        
         return out
 
     @torch.no_grad()
@@ -901,6 +990,7 @@ class LatentDiffusion(DDPM):
         loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
 
         logvar_t = self.logvar[t].to(self.device)
+
         loss = loss_simple / torch.exp(logvar_t) + logvar_t
         # loss = loss_simple / torch.exp(self.logvar) + self.logvar
         if self.learn_logvar:
@@ -1282,7 +1372,11 @@ class LatentDiffusion(DDPM):
         if self.learn_logvar:
             print('Diffusion model optimizing logvar')
             params.append(self.logvar)
-        opt = torch.optim.AdamW(params, lr=lr)
+
+        from colossalai.nn.optimizer import HybridAdam
+        opt = HybridAdam(params, lr=lr)
+
+        # opt = torch.optim.AdamW(params, lr=lr)
         if self.use_scheduler:
             assert 'target' in self.scheduler_config
             scheduler = instantiate_from_config(self.scheduler_config)
@@ -1374,7 +1468,10 @@ class LatentUpscaleDiffusion(LatentDiffusion):
                                                   force_c_encode=True, return_original_cond=True, bs=bs)
         x_low = batch[self.low_scale_key][:bs]
         x_low = rearrange(x_low, 'b h w c -> b c h w')
-        x_low = x_low.to(memory_format=torch.contiguous_format).float()
+        if self.use_fp16:
+            x_low = x_low.to(memory_format=torch.contiguous_format).half()
+        else:
+            x_low = x_low.to(memory_format=torch.contiguous_format).float()
         zx, noise_level = self.low_scale_model(x_low)
         if self.noise_level_key is not None:
             # get noise level from batch instead, e.g. when extracting a custom noise level for bsr
@@ -1655,7 +1752,10 @@ class LatentInpaintDiffusion(LatentFinetuneDiffusion):
         assert exists(self.concat_keys)
         c_cat = list()
         for ck in self.concat_keys:
-            cc = rearrange(batch[ck], 'b h w c -> b c h w').to(memory_format=torch.contiguous_format).float()
+            if self.use_fp16:
+                cc = rearrange(batch[ck], 'b h w c -> b c h w').to(memory_format=torch.contiguous_format).half()
+            else:
+                cc = rearrange(batch[ck], 'b h w c -> b c h w').to(memory_format=torch.contiguous_format).float()
             if bs is not None:
                 cc = cc[:bs]
                 cc = cc.to(self.device)
