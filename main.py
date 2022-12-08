@@ -789,8 +789,6 @@ if __name__ == "__main__":
         # run
         if opt.train:
             try:
-                for name, m in model.named_parameters():
-                    print(name)
                 trainer.fit(model, data)
             except Exception:
                 melk()
